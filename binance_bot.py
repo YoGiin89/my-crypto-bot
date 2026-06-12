@@ -1,19 +1,16 @@
 import os
-import threading
-from flask import Flask
 import requests
 import websocket
 import json
 import time
+import logging
+import threading
 
-# Flask для поддержания "жизни" на бесплатном тарифе Render
-app = Flask(__name__)
-@app.route('/')
-def home(): return "Bot is running!"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
-rsi_cache = {}
 
 LIQUIDATION_THRESHOLDS = {
     "btcusdt": 149000, "ethusdt": 79000, "bnbusdt": 79000, "xrpusdt": 79000,
@@ -49,9 +46,6 @@ SPOT_THRESHOLDS = {
 }
 
 def get_rsi(symbol, interval, period=14):
-    key = f"{symbol}_{interval}"
-    if key in rsi_cache and (time.time() - rsi_cache[key][0] < 60):
-        return rsi_cache[key][1]
     try:
         data = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={period+1}", timeout=5).json()
         closes = [float(c[4]) for c in data]
@@ -59,14 +53,15 @@ def get_rsi(symbol, interval, period=14):
         losses = [abs(min(closes[i]-closes[i-1], 0)) for i in range(1, len(closes))]
         avg_g, avg_l = sum(gains)/period, sum(losses)/period
         rs = avg_g/avg_l if avg_l != 0 else 100
-        val = round(100 - (100/(1+rs)), 2)
-        rsi_cache[key] = (time.time(), val)
-        return val
-    except: return None
+        return round(100 - (100/(1+rs)), 2)
+    except: return "N/A"
 
 def send_telegram(msg):
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
-    except: pass
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
+                      json={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
 
 def on_message(ws, message, is_futures):
     data = json.loads(message)
@@ -82,7 +77,17 @@ def on_message(ws, message, is_futures):
         if s in SPOT_THRESHOLDS and amt >= SPOT_THRESHOLDS[s]:
             send_telegram(f"<b>Spot Trade</b>\n{s.upper()}\n{amt:.0f} USDT\nRSI 4H: {get_rsi(s, '4h')}")
 
+def run_ws():
+    logging.info("Starting WebSocket connections...")
+    ws_futures = websocket.WebSocketApp("wss://fstream.binance.com/ws/!forceOrder@arr", 
+                                       on_message=lambda ws, m: on_message(ws, m, True))
+    spot_streams = "/".join([f"{s}@trade" for s in SPOT_THRESHOLDS.keys()])
+    ws_spot = websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{spot_streams}", 
+                                    on_message=lambda ws, m: on_message(ws, m, False))
+    threading.Thread(target=ws_futures.run_forever, kwargs={"ping_interval": 30}, daemon=True).start()
+    threading.Thread(target=ws_spot.run_forever, kwargs={"ping_interval": 30}, daemon=True).start()
+
 if __name__ == "__main__":
-    threading.Thread(target=lambda: websocket.WebSocketApp("wss://fstream.binance.com/ws/!forceOrder@arr", on_message=lambda ws, m: on_message(ws, m, True)).run_forever(ping_interval=30), daemon=True).start()
-    threading.Thread(target=lambda: websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{'/@trade/'.join(SPOT_THRESHOLDS.keys())}@trade", on_message=lambda ws, m: on_message(ws, m, False)).run_forever(ping_interval=30), daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    logging.info("Bot started successfully!")
+    run_ws()
+    while True: time.sleep(60)
