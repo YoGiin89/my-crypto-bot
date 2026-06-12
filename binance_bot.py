@@ -1,15 +1,20 @@
 import os
+import threading
+from flask import Flask
 import requests
 import websocket
 import json
 import time
-import threading
 
-# Настройки берутся из переменных среды Render
+# Flask для поддержания "жизни" на бесплатном тарифе Render
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot is running!"
+
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
+rsi_cache = {}
 
-# Списки пар
 LIQUIDATION_THRESHOLDS = {
     "btcusdt": 149000, "ethusdt": 79000, "bnbusdt": 79000, "xrpusdt": 79000,
     "solusdt": 79000, "dogeusdt": 79000, "dotusdt": 49000, "atomusdt": 39000,
@@ -43,14 +48,10 @@ SPOT_THRESHOLDS = {
     "trumpusdt": 79000
 }
 
-# Кэш для RSI
-rsi_cache = {}
-
 def get_rsi(symbol, interval, period=14):
     key = f"{symbol}_{interval}"
     if key in rsi_cache and (time.time() - rsi_cache[key][0] < 60):
         return rsi_cache[key][1]
-    
     try:
         data = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={period+1}", timeout=5).json()
         closes = [float(c[4]) for c in data]
@@ -81,9 +82,7 @@ def on_message(ws, message, is_futures):
         if s in SPOT_THRESHOLDS and amt >= SPOT_THRESHOLDS[s]:
             send_telegram(f"<b>Spot Trade</b>\n{s.upper()}\n{amt:.0f} USDT\nRSI 4H: {get_rsi(s, '4h')}")
 
-# Запуск
 if __name__ == "__main__":
-    # Потоки для WebSocket
     threading.Thread(target=lambda: websocket.WebSocketApp("wss://fstream.binance.com/ws/!forceOrder@arr", on_message=lambda ws, m: on_message(ws, m, True)).run_forever(ping_interval=30), daemon=True).start()
     threading.Thread(target=lambda: websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{'/@trade/'.join(SPOT_THRESHOLDS.keys())}@trade", on_message=lambda ws, m: on_message(ws, m, False)).run_forever(ping_interval=30), daemon=True).start()
-    while True: time.sleep(60)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
